@@ -1,0 +1,17 @@
+{
+  "name": "altos-adventure-game",
+  "version": "1.0.0",
+  "description": "一个使用 Phaser 3 开发的滑雪冒险游戏",
+  "main": "index.html",
+  "scripts": {
+    "start": "npx serve"
+  },
+  "keywords": [
+    "game",
+    "phaser",
+    "skiing",
+    "adventure"
+  ],
+  "author": "",
+  "license": "MIT"
+}
