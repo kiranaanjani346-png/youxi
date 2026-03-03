@@ -1,6 +1,6 @@
 // 游戏配置
 const config = {
-    type: Phaser.AUTO,
+    type: Phaser.WEBGL,
     scale: {
         mode: Phaser.Scale.FIT,
         autoCenter: Phaser.Scale.CENTER_BOTH,
@@ -8,17 +8,27 @@ const config = {
         height: 1080,
         parent: 'game-container'
     },
-    backgroundColor: '#87CEEB',
+    backgroundColor: '#1a1d2e',
     physics: {
         default: 'matter',
         matter: {
-            gravity: { y: 1 },
-            debug: false
+            gravity: { y: 1.2 },
+            debug: false,
+            enableSleeping: true
         }
     },
     scene: {
         create: create,
         update: update
+    },
+    fps: {
+        target: 60,
+        forceSetTimeOut: false
+    },
+    render: {
+        antialias: false,
+        pixelArt: false,
+        roundPixels: true
     }
 };
 
@@ -33,207 +43,210 @@ let score = 0;
 let scoreText;
 let gameOver = false;
 let lastTerrainX = 0;
+let snowParticles;
+let mountainLayers = [];
+let cameraTarget = { x: 0, y: 0 };
+let lastGroundAngle = 0;
+let isAirborne = false;
 
-// 地形生成器类（翻译自 Unity C# 代码）
+// 地形生成器
 class SurfaceGenerator {
-    constructor(yScaling = 80, detailScaling = 3, gridSize = 20) {
+    constructor(yScaling = 200, detailScaling = 80, gridSize = 20) {
         this.yScaling = yScaling;
         this.detailScaling = detailScaling;
         this.gridSize = gridSize;
     }
 
-    // Perlin Noise 实现（简化版）
-    perlinNoise(x, y) {
-        // 使用正弦和余弦组合模拟 Perlin Noise
-        const noise = Math.sin(x * 0.3) * Math.cos(y * 0.3) +
-                      Math.sin(x * 0.7) * 0.5 +
-                      Math.cos(y * 0.5) * 0.3;
-        return (noise + 2) / 4; // 归一化到 0-1
+    perlinNoise(x) {
+        const wave1 = Math.sin(x * 0.015) * 1.2;
+        const wave2 = Math.sin(x * 0.04) * 0.6;
+        const wave3 = Math.cos(x * 0.025) * 0.8;
+        const wave4 = Math.sin(x * 0.08) * 0.3;
+        return wave1 + wave2 + wave3 + wave4;
     }
 
-    // 生成地形顶点（翻译自 MeshCalculate）
     generateVertices(startX, startY) {
         const vertices = [];
-        const step = 30; // 每个顶点之间的距离
+        const step = 30;
 
         for (let i = 0; i <= this.gridSize; i++) {
             const x = startX + i * step;
-            const y = startY;
-
-            // 使用 Perlin Noise 计算高度
-            const noiseValue = this.perlinNoise(
-                x / this.detailScaling,
-                y / this.detailScaling
-            );
-
+            const noiseValue = this.perlinNoise(x / this.detailScaling);
             const z = noiseValue * this.yScaling;
-
-            vertices.push({ x: x, y: y + z });
+            vertices.push({ x: x, y: startY + z });
         }
 
         return vertices;
     }
+}
 
-    // 生成封闭的多边形顶点（用于 Matter.js）
-    generateClosedPolygon(startX, baseY) {
-        const topVertices = this.generateVertices(startX, baseY);
-        const vertices = [...topVertices];
+// 创建视差山脉层（优化版 - 减少顶点）
+function createMountainLayer(scene, depth, color, offsetY, scale) {
+    const graphics = scene.add.graphics();
+    graphics.fillStyle(color, 0.3);
+    graphics.setDepth(depth);
+    graphics.setScrollFactor(scale, 0);
 
-        // 添加底部顶点形成封闭多边形
-        const lastX = topVertices[topVertices.length - 1].x;
-        vertices.push({ x: lastX, y: baseY + 200 });
-        vertices.push({ x: startX, y: baseY + 200 });
-
-        return vertices;
+    const points = [];
+    for (let x = -500; x < 3000; x += 150) {
+        const noise = Math.sin(x * 0.003) * 150 + Math.cos(x * 0.007) * 80;
+        points.push({ x, y: 450 + offsetY + noise });
     }
+
+    graphics.beginPath();
+    graphics.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) {
+        graphics.lineTo(points[i].x, points[i].y);
+    }
+    graphics.lineTo(points[points.length - 1].x, 1080);
+    graphics.lineTo(points[0].x, 1080);
+    graphics.closePath();
+    graphics.fillPath();
+
+    return graphics;
 }
 
 // 创建游戏场景
 function create() {
     scene = this;
-    console.log('Game created!');
 
-    const generator = new SurfaceGenerator(80, 150, 20);
+    // 先创建白色粒子纹理
+    const tempGraphics = this.add.graphics();
+    tempGraphics.fillStyle(0xffffff, 1);
+    tempGraphics.fillCircle(2, 2, 2);
+    tempGraphics.generateTexture('white', 4, 4);
+    tempGraphics.destroy();
 
-    // 生成初始地形段
-    for (let i = 0; i < 5; i++) {
-        createTerrainSegment(scene, generator, i * 600);
+    // 视差山脉背景（减少到2层）
+    mountainLayers.push(createMountainLayer(this, -2, 0x2a2d44, -50, 0.2));
+    mountainLayers.push(createMountainLayer(this, -1, 0x4a4d64, 60, 0.4));
+
+    // 雪花粒子系统（减少频率）
+    snowParticles = this.add.particles(0, 0, 'white', {
+        x: { min: 0, max: 1920 },
+        y: -50,
+        lifespan: 6000,
+        speedY: { min: 30, max: 50 },
+        speedX: { min: -10, max: 10 },
+        scale: { start: 0.25, end: 0.1 },
+        alpha: { start: 0.6, end: 0.2 },
+        frequency: 250,
+        blendMode: 'ADD',
+        maxParticles: 80
+    });
+    snowParticles.setDepth(100);
+    snowParticles.setScrollFactor(0.6, 0.6);
+
+    // 生成地形（减少初始段数）
+    const generator = new SurfaceGenerator(200, 80, 20);
+    for (let i = 0; i < 4; i++) {
+        createTerrainSegment(this, generator, i * 625);
     }
 
-    // 创建玩家（在第一个地形段上方）
-    player = this.matter.add.rectangle(100, 300, 30, 40, {
-        friction: 0.01,
-        frictionAir: 0.005,
-        restitution: 0.2,
-        density: 0.001
+    // 创建玩家
+    player = this.matter.add.rectangle(200, 400, 28, 38, {
+        friction: 0.02,
+        frictionAir: 0.008,
+        restitution: 0.1,
+        density: 0.002,
+        chamfer: { radius: 4 }
     });
 
-    // 创建玩家图形
-    playerGraphic = this.add.rectangle(100, 300, 30, 40, 0xFF4444);
+    playerGraphic = this.add.rectangle(200, 400, 28, 38, 0xffffff);
+    playerGraphic.setDepth(10);
 
-    console.log('Player created:', player);
+    this.matter.body.setVelocity(player, { x: 4, y: 0 });
 
-    // 给玩家初始向右的速度
-    this.matter.body.setVelocity(player, { x: 3, y: 0 });
-
-    // 相机跟随玩家
+    // 相机固定跟随玩家
     this.cameras.main.startFollow(playerGraphic, true, 0.1, 0.1, -400, 0);
     this.cameras.main.setBounds(0, 0, 20000, 1080);
 
-    // 分数显示（适配大屏幕）
-    scoreText = this.add.text(30, 30, '距离: 0m', {
-        fontSize: '48px',
-        fontFamily: 'Arial, sans-serif',
-        fill: '#fff',
-        stroke: '#000',
-        strokeThickness: 6,
-        fontStyle: 'bold'
+    // 分数显示
+    scoreText = this.add.text(40, 40, '0m', {
+        fontSize: '56px',
+        fontFamily: 'Georgia, serif',
+        fill: '#ffffff',
+        alpha: 0.9
     });
     scoreText.setScrollFactor(0);
+    scoreText.setDepth(200);
 
     // 跳跃控制
     this.input.keyboard.on('keydown-SPACE', () => {
-        if (!gameOver) {
+        if (!gameOver && !isAirborne) {
             this.matter.body.setVelocity(player, {
                 x: player.velocity.x,
-                y: -12
+                y: -13
             });
+            isAirborne = true;
         }
     });
 
     this.input.on('pointerdown', () => {
-        if (!gameOver) {
+        if (!gameOver && !isAirborne) {
             this.matter.body.setVelocity(player, {
                 x: player.velocity.x,
-                y: -12
+                y: -13
             });
-        } else {
+            isAirborne = true;
+        } else if (gameOver) {
             location.reload();
         }
-    });
-
-    // 提示文字（适配大屏幕）
-    const hint = this.add.text(960, 200, '点击屏幕或按空格跳跃', {
-        fontSize: '48px',
-        fontFamily: 'Arial, sans-serif',
-        fill: '#fff',
-        stroke: '#000',
-        strokeThickness: 6
-    });
-    hint.setOrigin(0.5);
-    hint.setScrollFactor(0);
-
-    // 淡入淡出动画
-    hint.setAlpha(0);
-    this.tweens.add({
-        targets: hint,
-        alpha: 1,
-        duration: 1000,
-        ease: 'Sine.inOut'
-    });
-
-    this.time.delayedCall(4000, () => {
-        this.tweens.add({
-            targets: hint,
-            alpha: 0,
-            duration: 1000,
-            ease: 'Sine.inOut',
-            onComplete: () => hint.destroy()
-        });
     });
 }
 
 // 创建地形段
 function createTerrainSegment(scene, generator, startX) {
-    const baseY = 800; // 适配1080p高度
+    const baseY = 650;
+    const topVertices = generator.generateVertices(startX, baseY);
 
-    // 生成顶点
-    const vertices = generator.generateClosedPolygon(startX, baseY);
-
-    // 将顶点转换为相对于中心点的坐标
-    const centerX = startX + 300;
-    const centerY = baseY + 100;
-
-    const relativeVertices = vertices.map(v => ({
-        x: v.x - centerX,
-        y: v.y - centerY
-    }));
-
-    // 使用 Matter.js 创建地形刚体
-    const terrain = scene.matter.add.fromVertices(
-        centerX,
-        centerY,
-        relativeVertices,
-        {
-            isStatic: true,
-            friction: 0.8,
-            label: 'terrain'
-        },
-        true,
-        0.01,
-        10,
-        0.001
-    );
-
-    // 绘制地形图形
     const graphics = scene.add.graphics();
-    graphics.fillStyle(0xFFFFFF, 1);
-    graphics.lineStyle(3, 0xCCCCCC, 1);
+    graphics.setDepth(0);
+    const terrainBodies = [];
 
+    // 绘制雪地
+    graphics.fillStyle(0xffffff, 1);
     graphics.beginPath();
-    graphics.moveTo(vertices[0].x, vertices[0].y);
+    graphics.moveTo(topVertices[0].x, topVertices[0].y);
 
-    for (let i = 1; i < vertices.length; i++) {
-        graphics.lineTo(vertices[i].x, vertices[i].y);
+    for (let i = 1; i < topVertices.length; i++) {
+        graphics.lineTo(topVertices[i].x, topVertices[i].y);
     }
 
+    graphics.lineTo(topVertices[topVertices.length - 1].x, baseY + 400);
+    graphics.lineTo(topVertices[0].x, baseY + 400);
     graphics.closePath();
     graphics.fillPath();
-    graphics.strokePath();
+
+    // 创建物理体
+    for (let i = 0; i < topVertices.length - 1; i++) {
+        const v1 = topVertices[i];
+        const v2 = topVertices[i + 1];
+
+        const heightDiff = v2.y - v1.y;
+        const distance = v2.x - v1.x;
+        const slope = distance > 0 ? Math.abs(heightDiff / distance) : 0;
+
+        if (slope < 1.2) {
+            const segmentWidth = Math.sqrt((v2.x - v1.x) ** 2 + (v2.y - v1.y) ** 2);
+            const centerX = (v1.x + v2.x) / 2;
+            const centerY = (v1.y + v2.y) / 2;
+            const angle = Math.atan2(v2.y - v1.y, v2.x - v1.x);
+
+            const body = scene.matter.add.rectangle(centerX, centerY, segmentWidth, 15, {
+                isStatic: true,
+                friction: 0.6,
+                angle: angle,
+                label: 'terrain'
+            });
+
+            terrainBodies.push({ body, angle });
+        }
+    }
 
     terrainSegments.push({
         x: startX,
-        body: terrain,
+        bodies: terrainBodies,
         graphics: graphics
     });
 
@@ -241,29 +254,41 @@ function createTerrainSegment(scene, generator, startX) {
 }
 
 // 更新游戏
-function update() {
+function update(time, delta) {
     if (gameOver) return;
 
-    // 同步玩家图形位置
+    // 同步玩家图形
     playerGraphic.x = player.position.x;
     playerGraphic.y = player.position.y;
     playerGraphic.rotation = player.angle;
 
-    // 持续向右推力（模拟滑雪动力）
-    if (player.velocity.x < 6) {
-        scene.matter.body.applyForce(player, player.position, { x: 0.001, y: 0 });
+    // 检测是否在地面
+    const wasAirborne = isAirborne;
+    isAirborne = Math.abs(player.velocity.y) > 0.5;
+
+    // 落地检测与相机抖动
+    if (wasAirborne && !isAirborne) {
+        const impactAngle = Math.abs(player.angle);
+        if (impactAngle > 0.4) {
+            scene.cameras.main.shake(80, 0.002);
+        }
     }
 
-    // 生成新地形段
-    if (player.position.x > lastTerrainX - 1200) {
-        const generator = new SurfaceGenerator(80, 150, 20);
-        createTerrainSegment(scene, generator, lastTerrainX + 600);
+    // 持续加速
+    if (player.velocity.x < 8) {
+        scene.matter.body.applyForce(player, player.position, { x: 0.0015, y: 0 });
     }
 
-    // 清理屏幕外的地形
+    // 生成新地形
+    if (player.position.x > lastTerrainX - 1500) {
+        const generator = new SurfaceGenerator(200, 80, 25);
+        createTerrainSegment(scene, generator, lastTerrainX + 625);
+    }
+
+    // 清理旧地形
     terrainSegments = terrainSegments.filter(segment => {
-        if (segment.x < player.position.x - 800) {
-            scene.matter.world.remove(segment.body);
+        if (segment.x < player.position.x - 1000) {
+            segment.bodies.forEach(b => scene.matter.world.remove(b.body));
             segment.graphics.destroy();
             return false;
         }
@@ -272,21 +297,26 @@ function update() {
 
     // 更新分数
     score = Math.max(0, Math.floor(player.position.x / 10));
-    scoreText.setText('距离: ' + score + 'm');
+    scoreText.setText(score + 'm');
 
     // 检查掉落
-    if (player.position.y > 1200) {
+    if (player.position.y > 1400) {
         gameOver = true;
-        console.log('Game Over! Player fell off.');
-        const gameOverText = scene.add.text(player.position.x, 540, '游戏结束!\n最终距离: ' + score + 'm\n点击重新开始', {
-            fontSize: '72px',
-            fontFamily: 'Arial, sans-serif',
-            fill: '#fff',
-            stroke: '#000',
-            strokeThickness: 8,
-            align: 'center',
-            fontStyle: 'bold'
+        const gameOverText = scene.add.text(player.position.x, 540, score + 'm', {
+            fontSize: '120px',
+            fontFamily: 'Georgia, serif',
+            fill: '#ffffff',
+            alpha: 0.95
         });
         gameOverText.setOrigin(0.5);
+        gameOverText.setDepth(300);
+
+        scene.tweens.add({
+            targets: gameOverText,
+            alpha: 1,
+            scale: 1.1,
+            duration: 800,
+            ease: 'Sine.inOut'
+        });
     }
 }
